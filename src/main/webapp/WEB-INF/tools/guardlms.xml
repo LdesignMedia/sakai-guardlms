@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<registration>
+  <tool id="guardlms.admin" title="GuardLMS" description="Connect and report this Sakai server's software inventory." home="/guardlms/" access="security">
+    <category name="admin" />
+    <configuration name="sakai:height" value="900" />
+  </tool>
+</registration>

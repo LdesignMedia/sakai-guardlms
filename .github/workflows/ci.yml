@@ -1,0 +1,25 @@
+name: Sakai connector
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: pom.xml
+      - run: mvn -B verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guardlms-sakai-war
+          path: target/guardlms.war
+          retention-days: 14
