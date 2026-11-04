@@ -51,18 +51,35 @@ for that integration.
 
 ### 1. Obtain the WAR
 
-Build the plugin from this repository:
+Download **`guardlms.war`** from the
+[latest release](https://github.com/LdesignMedia/sakai-guardlms/releases/latest).
+No Java or Maven installation is needed on your workstation. Repository access
+is required to download releases from this private repository.
+
+Every successful CI build after a merge or push to `main` publishes a release
+tagged `build-<run number>`, with the tested WAR and `guardlms.war.sha256`.
+Release notes identify the exact source commit and CI run. Download both files
+to the same directory to verify the checksum:
+
+```sh
+sha256sum --check guardlms.war.sha256
+```
+
+On macOS, use `shasum -a 256 --check guardlms.war.sha256` instead.
+
+Alternatively, build from source with Java 17 and Maven 3.9+:
 
 ```sh
 git clone git@github.com:LdesignMedia/sakai-guardlms.git
 cd sakai-guardlms
-mvn package
+mvn verify
 ```
 
-The installable file is **`target/guardlms.war`**. A successful
+The locally built file is **`target/guardlms.war`**. A successful
 [CI run](https://github.com/LdesignMedia/sakai-guardlms/actions/workflows/ci.yml)
-also provides a `guardlms-sakai-war` artifact containing that WAR; check which
-branch and commit the artifact was built from.
+also provides a `guardlms-sakai-war` artifact containing the WAR and checksum for
+14 days, including pull request builds. Check which branch and commit the
+artifact was built from; pull request builds do not publish releases.
 
 ### 2. Configure Sakai once
 
@@ -93,8 +110,10 @@ query strings, fragments, `/portal`, or `/guardlms` in `guardlms.siteUrl`.
 Stop Tomcat using your usual service-management procedure, then copy the WAR:
 
 ```sh
-cp target/guardlms.war "$CATALINA_BASE/webapps/guardlms.war"
+cp guardlms.war "$CATALINA_BASE/webapps/guardlms.war"
 ```
+
+When building from source, use `target/guardlms.war` as the source path instead.
 
 Start Tomcat again. Log in to Sakai as a superuser and open:
 
