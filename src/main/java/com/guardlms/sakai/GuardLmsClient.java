@@ -44,11 +44,17 @@ final class GuardLmsClient {
         }
         byte[] body = response.body();
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new IOException("GuardLMS HTTP " + response.statusCode());
+            throw new HttpStatusException(response.statusCode());
         }
         try { return JsonParser.parseString(new String(body, java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject(); }
         catch (RuntimeException e) { throw new IOException("GuardLMS returned invalid JSON"); }
     }
+    static final class HttpStatusException extends IOException {
+        private final int status;
+        HttpStatusException(int status) { super("GuardLMS HTTP " + status); this.status = status; }
+        int status() { return status; }
+    }
+
     private static final class LimitedBody implements HttpResponse.BodySubscriber<byte[]> {
         private final HttpResponse.BodySubscriber<byte[]> delegate = HttpResponse.BodySubscribers.ofByteArray();
         private Flow.Subscription subscription;
