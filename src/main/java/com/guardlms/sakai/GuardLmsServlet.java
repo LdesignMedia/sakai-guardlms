@@ -97,8 +97,18 @@ public final class GuardLmsServlet extends HttpServlet {
                         res.sendRedirect(dashboardUrl + "/connect/sakai?" + query(Map.of(
                             "siteurl", siteUrl, "callback", siteUrl + "/guardlms/callback", "state", state)));
                         return;
-                    case "/push": store.locked(p -> { if (!connected(p)) throw new IllegalStateException("Disconnected"); push(p); return null; }); break;
-                    case "/disconnect": store.locked(p -> { p.clear(); p.setProperty("generation", random()); return null; }); break;
+                    case "/push":
+                        String pushNotice = store.locked(p -> {
+                            if (!connected(p)) throw new IllegalStateException("Disconnected");
+                            push(p);
+                            return p.containsKey("lastError") ? "The inventory could not be sent. Check the connection status below; Sakai will retry automatically." : "Inventory received by GuardLMS.";
+                        });
+                        session.setAttribute("guardlms.notice", pushNotice);
+                        break;
+                    case "/disconnect":
+                        store.locked(p -> { p.clear(); p.setProperty("generation", random()); return null; });
+                        session.setAttribute("guardlms.notice", "Disconnected from GuardLMS. Reporting has stopped.");
+                        break;
                     default: res.sendError(404); return;
                 }
                 res.sendRedirect(req.getContextPath() + "/"); return;
@@ -128,10 +138,14 @@ public final class GuardLmsServlet extends HttpServlet {
                     p.setProperty("generation", random());
                     p.setProperty("credential", store.encrypt(data.get("token").getAsString()));
                     p.setProperty("siteUrl", siteUrl);
+                    if (data.has("website_id") && !data.get("website_id").isJsonNull()) p.setProperty("websiteId", data.get("website_id").getAsString());
                     p.setProperty("verificationToken", data.get("verification_token").getAsString());
                     if (data.has("expires_at") && !data.get("expires_at").isJsonNull()) p.setProperty("expiresAt", data.get("expires_at").getAsString());
                     p.setProperty("connectedAt", Instant.now().toString());
                     push(p);
+                    session.setAttribute("guardlms.notice", p.containsKey("lastError")
+                        ? "Connected to GuardLMS. Your first inventory could not be sent; Sakai will retry automatically."
+                        : "Connected to GuardLMS. Your first inventory has been received.");
                     return null;
                 });
                 res.sendRedirect(req.getContextPath() + "/"); return;
@@ -141,11 +155,21 @@ public final class GuardLmsServlet extends HttpServlet {
             }
             if (!path.equals("/")) { res.sendError(404); return; }
             Properties status = store.locked(p -> { Properties copy = new Properties(); copy.putAll(p); copy.setProperty("connected", Boolean.toString(connected(p))); copy.remove("credential"); return copy; });
+            String notice;
+            synchronized (session) {
+                notice = (String) session.getAttribute("guardlms.notice");
+                session.removeAttribute("guardlms.notice");
+            }
             res.setContentType("text/html");
-            res.getWriter().write(page(csrf, status, req.getContextPath()));
+            res.getWriter().write(page(csrf, status, req.getContextPath(), notice));
         } catch (Exception e) {
             if (e instanceof SecurityException) { res.sendError(403); return; }
             getServletContext().log("GuardLMS request failed (" + e.getClass().getSimpleName() + ")");
+            if ("/callback".equals(req.getPathInfo())) {
+                sessions.getCurrentSession().setAttribute("guardlms.notice", "Connection could not be completed. Try connecting again. If this continues, check the GuardLMS service and your server's HTTPS configuration.");
+                res.sendRedirect(req.getContextPath() + "/");
+                return;
+            }
             res.setStatus(502); res.setContentType("text/plain");
             res.getWriter().write("GuardLMS request failed. Check the connection status and server configuration, then retry.");
         }
@@ -157,17 +181,10 @@ public final class GuardLmsServlet extends HttpServlet {
             JsonObject response = client.post("/api/externalpush/sakai", inventory(), store.decrypt(state.getProperty("credential")));
             JsonObject result = response.getAsJsonObject("data");
             if (result == null || result.get("stale").getAsBoolean()) throw new IOException("Inventory not accepted");
-            state.setProperty("lastSuccess", Instant.now().toString());
-            state.setProperty("components", result.get("components_upserted").getAsString());
-            state.remove("lastError"); state.remove("failures");
-            state.setProperty("nextAttempt", Long.toString(now() + 86400));
+            ConnectionStatus.accepted(state, result.get("components_upserted").getAsInt(), Instant.now());
         } catch (Exception e) {
             if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-            long failures = Math.min(seconds(state, "failures") + 1, 10);
-            state.setProperty("failures", Long.toString(failures));
-            state.setProperty("lastError", e instanceof IOException && e.getMessage() != null && e.getMessage().matches("GuardLMS HTTP [0-9]{3}")
-                ? e.getMessage() : "Connection failed; check HTTPS trust, credentials and site URL");
-            state.setProperty("nextAttempt", Long.toString(now() + Math.min(3600, 60L << (failures - 1))));
+            ConnectionStatus.failed(state, e, Instant.now());
         }
     }
 
@@ -226,32 +243,80 @@ public final class GuardLmsServlet extends HttpServlet {
         return payload;
     }
 
-    private String page(String csrf, Properties state, String context) {
-        StringBuilder html = new StringBuilder("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>GuardLMS for Sakai</title><style>body{font:16px system-ui;margin:2rem;max-width:70rem;color:#172b4d}button,a{margin:.5rem .5rem .5rem 0}dt{font-weight:bold}dd{margin:0 0 1rem}button{padding:.6rem 1rem}form{display:inline}</style></head><body><h1>GuardLMS for Sakai</h1>");
-        html.append("<p>Reports Sakai, registered tools, Java, Tomcat and operating system metadata daily. Course and learner records are never collected. Tool versions and update availability stay unknown unless explicitly known.</p><dl><dt>Site URL</dt><dd>").append(escape(siteUrl)).append("</dd><dt>Connection</dt><dd>").append(Boolean.parseBoolean(state.getProperty("connected")) ? "Connected" : "Disconnected").append("</dd>");
-        Map<String, String> fields = new LinkedHashMap<>();
-        fields.put("components", "Components reported");
-        fields.put("lastSuccess", "Last accepted inventory");
-        fields.put("nextAttempt", "Next reporting attempt");
-        fields.put("lastError", "Last error");
-        fields.put("expiresAt", "Key expires");
-        fields.put("verificationToken", "Ownership verification token");
-        var dateFormat = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'").withZone(java.time.ZoneOffset.UTC);
-        for (var field : fields.entrySet()) {
-            String value = state.getProperty(field.getKey(), "—");
-            if (!value.equals("—")) {
-                try {
-                    if (field.getKey().equals("nextAttempt")) value = dateFormat.format(Instant.ofEpochSecond(Long.parseLong(value)));
-                    else if (Set.of("lastSuccess", "expiresAt").contains(field.getKey())) value = dateFormat.format(Instant.parse(value));
-                } catch (java.time.DateTimeException | NumberFormatException ignored) { value = "Unavailable"; }
+    private String page(String csrf, Properties state, String context, String notice) {
+        boolean hasConnection = Boolean.parseBoolean(state.getProperty("connected"));
+        boolean reconnect = hasConnection && ConnectionStatus.requiresReconnect(state, Instant.now());
+        String label = ConnectionStatus.label(state, hasConnection, Instant.now());
+        String badge = !hasConnection ? "disconnected" : reconnect ? "rejected" : "connected";
+        StringBuilder html = new StringBuilder("""
+            <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>GuardLMS for Sakai</title><style>
+            *{box-sizing:border-box}body{font:16px/1.55 system-ui,sans-serif;margin:0;background:#f6f7f9;color:#172b4d}
+            main{max-width:960px;margin:3rem auto;padding:0 1.25rem}h1{margin-bottom:.25rem}h2{font-size:1.25rem;margin-top:0}
+            p{margin:.7rem 0}section,details{background:white;border:1px solid #dce2e9;border-radius:10px;padding:1.5rem;margin:1.25rem 0}
+            .badge{display:inline-block;padding:.15rem .7rem;border-radius:20px;font-weight:650}.connected{background:#d7f5df;color:#0a6b31}
+            .disconnected{background:#fcdada;color:#a02020}.rejected{background:#fcf0d3;color:#805000}.notice{padding:1rem;background:#eef4ff;border-left:4px solid #3156a6}
+            .warning{padding:1rem;background:#fff6df;border-left:4px solid #9c6500}.actions{display:flex;gap:.6rem;flex-wrap:wrap;margin:1rem 0}
+            button,.link-button{display:inline-block;font:inherit;padding:.6rem 1rem;border:1px solid #aab4c3;border-radius:6px;background:white;color:#172b4d;cursor:pointer;text-decoration:none}
+            .primary{background:#fa6e10;border-color:#fa6e10;color:#172b4d;font-weight:650}.primary:hover{background:#ee6307}
+            .danger{color:#b32d2e;border-color:#b32d2e}a{color:#1d4f9c}button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #3156a6;outline-offset:3px}
+            dl{display:grid;grid-template-columns:minmax(140px,1fr) 2fr;gap:.6rem 1rem;margin-bottom:0}dt{font-weight:650}dd{margin:0;overflow-wrap:anywhere}
+            summary{font-weight:650;cursor:pointer}.muted{color:#4e6079}code{overflow-wrap:anywhere}@media(max-width:600px){main{margin:1.5rem auto}dl{grid-template-columns:1fr;gap:.2rem}dd{margin-bottom:.6rem}}
+            </style></head><body><main><header><h1>GuardLMS for Sakai</h1><p class="muted">Daily software inventory, connected to your GuardLMS account.</p></header>
+            """);
+        if (notice != null) html.append("<p class=\"notice\" role=\"alert\">").append(escape(notice)).append("</p>");
+        html.append("<section aria-labelledby=\"connection-heading\"><h2 id=\"connection-heading\">Connection</h2><p>Status: <span role=\"status\" class=\"badge ").append(badge).append("\">").append(label).append("</span></p>");
+        if (!hasConnection) {
+            html.append("<p>Connect this Sakai server to GuardLMS to start daily inventory reporting. Sign in or create an account, review this site, and approve the connection.</p><p>No API key to copy. GuardLMS installs a key for this site and receives the first inventory automatically.</p>");
+        } else if (reconnect) {
+            html.append("<div class=\"warning\"><p>GuardLMS has refused this site's key, or the key has expired. Reporting needs your attention. Click <strong>Reconnect</strong> to install a new key.</p>");
+            if (state.containsKey("authRejectedAt")) html.append("<p>First refused push: ").append(escape(date(state.getProperty("authRejectedAt"), false))).append("</p>");
+            html.append("<p>Your existing key is kept so reporting can recover if a temporary service issue clears.</p></div>");
+        } else if (state.containsKey("lastError")) {
+            html.append("<div class=\"warning\"><p>The site is connected, but the last inventory was not accepted. Sakai will retry automatically. You can also try <strong>Push inventory now</strong>.</p></div>");
+        } else {
+            html.append("<p>Your site is connected. Sakai sends its software inventory daily while the server is running.</p>");
+        }
+        html.append("<p><strong>Site:</strong> ").append(escape(siteUrl)).append("</p><div class=\"actions\">");
+        action(html, context, csrf, "connect", hasConnection ? "Reconnect" : "Connect to GuardLMS", "primary");
+        if (hasConnection) {
+            action(html, context, csrf, "push", "Push inventory now", "");
+            action(html, context, csrf, "disconnect", "Disconnect", "danger");
+            String websiteId = state.getProperty("websiteId", "");
+            if (websiteId.matches("[1-9][0-9]*")) html.append("<a class=\"link-button\" href=\"").append(escape(dashboardUrl + "/websites/" + websiteId)).append("\" target=\"_top\">Open in GuardLMS</a>");
+        }
+        html.append("</div>");
+        if (hasConnection) {
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("connectedAt", "Connected on");
+            fields.put("lastSuccess", "Last accepted inventory");
+            fields.put("components", "Components reported");
+            fields.put("nextAttempt", "Next reporting attempt");
+            fields.put("expiresAt", "Key expires");
+            html.append("<dl>");
+            for (var field : fields.entrySet()) {
+                String value = state.getProperty(field.getKey(), "—");
+                if (Set.of("connectedAt", "lastSuccess", "expiresAt").contains(field.getKey())) value = date(value, false);
+                if (field.getKey().equals("nextAttempt")) value = date(value, true);
+                html.append("<dt>").append(field.getValue()).append("</dt><dd>").append(escape(value)).append("</dd>");
             }
-            html.append("<dt>").append(field.getValue()).append("</dt><dd>").append(escape(value)).append("</dd>");
+            html.append("</dl>");
         }
-        html.append("</dl><p>If ownership verification remains pending in GuardLMS, use its DNS verification instructions. The token above can also be added to the public portal's HTML head using your Sakai theme.</p>");
-        for (var action : Map.of("connect", "Connect to GuardLMS", "push", "Push inventory now", "disconnect", "Disconnect").entrySet()) {
-            html.append("<form method=\"post\" action=\"").append(context).append('/').append(action.getKey()).append("\"><input type=\"hidden\" name=\"csrf\" value=\"").append(escape(csrf)).append("\"><button type=\"submit\">").append(action.getValue()).append("</button></form>");
-        }
-        return html.append("<p><a href=\"").append(context).append("/preview\">Preview inventory payload</a></p></body></html>").toString();
+        html.append("</section><section aria-labelledby=\"reporting-heading\"><h2 id=\"reporting-heading\">What this connector reports</h2><p>Sakai, registered tools, Java, Tomcat, operating system and database versions. Course and learner records are never collected. Tool versions and update availability stay unknown unless explicitly known.</p></section>");
+        html.append("<details><summary>Advanced connection details</summary><p><a href=\"").append(escape(context)).append("/preview\">Preview inventory payload</a></p><dl><dt>Last reporting error</dt><dd>").append(escape(state.getProperty("lastError", "None"))).append("</dd><dt>Ownership verification token</dt><dd>").append(escape(state.getProperty("verificationToken", "Not connected"))).append("</dd></dl><p>If ownership remains pending in GuardLMS, use its DNS verification instructions. You can also add the public verification token to the portal's HTML head through your Sakai theme.</p></details>");
+        return html.append("</main></body></html>").toString();
+    }
+
+    private static void action(StringBuilder html, String context, String csrf, String path, String label, String style) {
+        html.append("<form method=\"post\" action=\"").append(escape(context)).append('/').append(path).append("\" target=\"_top\"><input type=\"hidden\" name=\"csrf\" value=\"").append(escape(csrf)).append("\"><button type=\"submit\" class=\"").append(style).append("\">").append(label).append("</button></form>");
+    }
+
+    private static String date(String value, boolean unixTime) {
+        if (value.equals("—")) return value;
+        try {
+            Instant instant = unixTime ? Instant.ofEpochSecond(Long.parseLong(value)) : Instant.parse(value);
+            return java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'").withZone(java.time.ZoneOffset.UTC).format(instant);
+        } catch (java.time.DateTimeException | NumberFormatException ignored) { return "Unavailable"; }
     }
 
     static String escape(String value) { return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;"); }
